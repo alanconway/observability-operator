@@ -13,6 +13,8 @@ import (
 
 type UIPluginInfo struct {
 	Image               string
+	Korrel8rImage       string
+	LokiServiceNames    map[string]string
 	Name                string
 	ConsoleName         string
 	DisplayName         string
@@ -109,7 +111,9 @@ func PluginInfoBuilder(plugin *uiv1alpha1.UIPlugin, pluginConf UIPluginsConfigur
 		}
 	case uiv1alpha1.TypeTroubleshootingPanel:
 		{
-			return createTroubleshootingPanelPluginInfo(plugin, namespace, plugin.Name, image, []string{})
+			pluginInfo, _ := createTroubleshootingPanelPluginInfo(plugin, namespace, plugin.Name, image, []string{})
+			pluginInfo.Korrel8rImage = pluginConf.Images["korrel8r"]
+			return pluginInfo, nil
 		}
 	case uiv1alpha1.TypeDistributedTracing:
 		{

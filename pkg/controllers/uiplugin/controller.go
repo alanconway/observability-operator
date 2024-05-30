@@ -158,6 +158,13 @@ func (rm resourceManager) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
+	if pluginInfo.Korrel8rImage != "" {
+		var OpenshiftLoggingNs = "openshift-logging"
+		var OpenshiftNetobservNs = "netobserv"
+		pluginInfo.LokiServiceNames[OpenshiftLoggingNs], _ = getLokiServiceName(ctx, rm.k8sClient, OpenshiftLoggingNs)
+		pluginInfo.LokiServiceNames[OpenshiftNetobservNs], _ = getLokiServiceName(ctx, rm.k8sClient, OpenshiftNetobservNs)
+	}
+
 	reconcilers := pluginComponentReconcilers(plugin, *pluginInfo)
 	for _, reconciler := range reconcilers {
 		err := reconciler.Reconcile(ctx, rm.k8sClient, rm.scheme)

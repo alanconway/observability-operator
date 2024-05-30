@@ -2,6 +2,7 @@ package uiplugin
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 
@@ -9,6 +10,7 @@ import (
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	uiv1alpha1 "github.com/rhobs/observability-operator/pkg/apis/uiplugin/v1alpha1"
 )
@@ -46,6 +48,7 @@ func createTroubleshootingPanelPluginInfo(plugin *uiv1alpha1.UIPlugin, namespace
 		ConsoleName:       "troubleshooting-panel-console-plugin",
 		DisplayName:       "Troubleshooting Panel Console Plugin",
 		ResourceNamespace: namespace,
+		LokiServiceNames:  make(map[string]string),
 		ExtraArgs:         extraArgs,
 		Proxies: []osv1alpha1.ConsolePluginProxy{
 			{
@@ -98,4 +101,30 @@ func marshalTroubleshootingPanelPluginConfig(cfg *uiv1alpha1.TroubleshootingPane
 	}
 
 	return buf.String(), nil
+}
+
+func getLokiServiceName(ctx context.Context, k client.Client, ns string) (string, error) {
+
+	serviceList := &corev1.ServiceList{}
+	if err := k.List(ctx, serviceList, client.InNamespace(ns)); err != nil {
+		return "", err
+	}
+
+	// Accumulate services that contain "gateway" in their names
+	var gatewayServices []corev1.Service
+	for _, service := range serviceList.Items {
+		if strings.Contains(service.Name, "gateway") {
+			gatewayServices = append(gatewayServices, service)
+		}
+	}
+	key := "app.kubernetes.io/managed-by"
+	if len(gatewayServices) > 0 {
+		for _, service := range gatewayServices {
+			// Check if the service has the lokistack label
+			if service.Labels[key] == "lokistack-controller" {
+				return service.Name, nil
+			}
+		}
+	}
+	return "", nil
 }

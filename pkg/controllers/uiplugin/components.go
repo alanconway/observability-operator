@@ -1,7 +1,11 @@
 package uiplugin
 
 import (
+	"bytes"
+	"embed"
 	"fmt"
+	"io"
+	"text/template"
 
 	osv1alpha1 "github.com/openshift/api/console/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -16,9 +20,18 @@ import (
 )
 
 const (
-	port                  = 9443
-	serviceAccountSuffix  = "-sa"
-	servingCertVolumeName = "serving-cert"
+	port                   = 9443
+	serviceAccountSuffix   = "-sa"
+	servingCertVolumeName  = "serving-cert"
+	Korrel8rConfigFileName = "korrel8r.yaml"
+	Korrel8rConfigMountDir = "/config/"
+	OpenshiftLoggingNs     = "openshift-logging"
+	OpenshiftNetobservNs   = "netobserv"
+)
+
+var (
+	//go:embed config/korrel8r.yaml
+	korrel8rConfigYAMLTmplFile embed.FS
 )
 
 func pluginComponentReconcilers(plugin *uiv1alpha1.UIPlugin, pluginInfo UIPluginInfo) []reconciler.Reconciler {
@@ -41,6 +54,13 @@ func pluginComponentReconcilers(plugin *uiv1alpha1.UIPlugin, pluginInfo UIPlugin
 
 	if pluginInfo.ConfigMap != nil {
 		components = append(components, reconciler.NewUpdater(pluginInfo.ConfigMap, plugin))
+	}
+
+	if pluginInfo.Korrel8rImage != "" {
+		kname := "korrel8r"
+		components = append(components, reconciler.NewUpdater(newKorrel8rService(kname, namespace), plugin))
+		components = append(components, reconciler.NewUpdater(newKorrel8rConfigMap(kname, namespace, pluginInfo), plugin))
+		components = append(components, reconciler.NewUpdater(newKorrel8rDeployment(kname, namespace, pluginInfo), plugin))
 	}
 
 	for _, role := range pluginInfo.ClusterRoles {
@@ -244,6 +264,162 @@ func newService(info UIPluginInfo, namespace string) *corev1.Service {
 			},
 			Selector: componentLabels(info.Name),
 			Type:     corev1.ServiceTypeClusterIP,
+		},
+	}
+}
+
+func newKorrel8rDeployment(name string, namespace string, info UIPluginInfo) *appsv1.Deployment {
+	volumes := []corev1.Volume{
+		{
+			Name: servingCertVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  name,
+					DefaultMode: ptr.To(int32(420)),
+				},
+			},
+		},
+	}
+	volumeMounts := []corev1.VolumeMount{
+		{
+			Name:      servingCertVolumeName,
+			ReadOnly:  true,
+			MountPath: "/secrets/",
+		},
+	}
+
+	volumes = append(volumes, corev1.Volume{
+		Name: "korrel8r-config",
+		VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: name,
+				},
+			},
+		},
+	})
+	volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		Name:      "korrel8r-config",
+		ReadOnly:  true,
+		MountPath: Korrel8rConfigMountDir,
+	})
+
+	deploy := &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: appsv1.SchemeGroupVersion.String(),
+			Kind:       "Deployment",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    componentLabels(name),
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: componentLabels(name),
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: namespace,
+					Labels:    componentLabels(name),
+				},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: info.Name + serviceAccountSuffix,
+					Containers: []corev1.Container{
+						{
+							Name:    name,
+							Image:   info.Korrel8rImage,
+							Command: []string{"korrel8r", "web", "--https=:8443", "--cert=/secrets/tls.crt", "--key=/secrets/tls.key", "--config=/config/korrel8r.yaml"},
+							Ports: []corev1.ContainerPort{
+								{
+									ContainerPort: 8443,
+									Protocol:      corev1.ProtocolTCP,
+								},
+							},
+							SecurityContext: &corev1.SecurityContext{
+								RunAsNonRoot:             ptr.To(true),
+								AllowPrivilegeEscalation: ptr.To(false),
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{
+										"ALL",
+									},
+								},
+								SeccompProfile: &corev1.SeccompProfile{
+									Type: corev1.SeccompProfileTypeRuntimeDefault,
+								},
+							},
+							VolumeMounts: volumeMounts,
+						},
+					},
+					Volumes: volumes,
+				},
+			},
+		},
+	}
+	return deploy
+}
+
+func newKorrel8rService(name string, namespace string) *corev1.Service {
+	annotations := map[string]string{
+		"service.alpha.openshift.io/serving-cert-secret-name": name,
+	}
+
+	return &corev1.Service{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: corev1.SchemeGroupVersion.String(),
+			Kind:       "Service",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   namespace,
+			Labels:      componentLabels(name),
+			Annotations: annotations,
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{
+					Port:       port,
+					Name:       "web",
+					Protocol:   corev1.ProtocolTCP,
+					TargetPort: intstr.FromInt32(port),
+				},
+			},
+			Selector: componentLabels(name),
+			Type:     corev1.ServiceTypeClusterIP,
+		},
+	}
+}
+
+func newKorrel8rConfigMap(name string, namespace string, info UIPluginInfo) *corev1.ConfigMap {
+
+	korrel8rData := map[string]string{"Metric": "thanos-querier", "MetricAlert": "alertmanager-main", "Log": "logging-loki-gateway-http", "Netflow": "loki-gateway-http"}
+
+	if info.LokiServiceNames[OpenshiftLoggingNs] != "" {
+		korrel8rData["Log"] = info.LokiServiceNames[OpenshiftLoggingNs]
+	}
+	if info.LokiServiceNames[OpenshiftNetobservNs] != "" {
+		korrel8rData["Netflow"] = info.LokiServiceNames[OpenshiftNetobservNs]
+	}
+
+	var korrel8rConfigYAMLTmpl = template.Must(template.ParseFS(korrel8rConfigYAMLTmplFile, "config/korrel8r.yaml"))
+	w := bytes.NewBuffer(nil)
+	korrel8rConfigYAMLTmpl.Execute(w, korrel8rData)
+
+	cfg, _ := io.ReadAll(w)
+
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConfigMap",
+			APIVersion: corev1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    componentLabels(name),
+		},
+		Data: map[string]string{
+			Korrel8rConfigFileName: string(cfg),
 		},
 	}
 }

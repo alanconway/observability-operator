@@ -42,6 +42,7 @@ var defaultImages = map[string]string{
 	"ui-dashboards":            "quay.io/openshift-observability-ui/console-dashboards-plugin:v0.1.0",
 	"ui-troubleshooting-panel": "quay.io/openshift-observability-ui/troubleshooting-panel-console-plugin:v0.1.0",
 	"ui-distributed-tracing":   "quay.io/openshift-observability-ui/distributed-tracing-console-plugin:v0.1.0",
+	"korrel8r":                 "quay.io/korrel8r/korrel8r:0.6.6",
 }
 
 func imagesUsed() []string {
