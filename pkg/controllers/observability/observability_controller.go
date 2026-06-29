@@ -35,6 +35,9 @@ const (
 
 	conditionReasonError    = "ReconcileError"
 	conditionTypeReconciled = "Reconciled"
+
+	otelCollectorResourceName = "cluster-collector"
+	tempoStackResourceName    = "tempostack"
 )
 
 // RBAC for the ObservabilityInstaller CRD
@@ -210,7 +213,7 @@ func (o observabilityInstallerController) updateStatus(ctx context.Context, inst
 			otelcol := &otelv1beta1.OpenTelemetryCollector{}
 			err := o.client.Get(ctx, types.NamespacedName{
 				Namespace: instance.Namespace,
-				Name:      otelCollectorName(instance.Name),
+				Name:      otelCollectorResourceName,
 			}, otelcol)
 			if err != nil {
 				return ctrl.Result{RequeueAfter: 2 * time.Second}
@@ -218,14 +221,14 @@ func (o observabilityInstallerController) updateStatus(ctx context.Context, inst
 			tempo := &tempov1alpha1.TempoStack{}
 			err = o.client.Get(ctx, types.NamespacedName{
 				Namespace: instance.Namespace,
-				Name:      tempoName(instance.Name),
+				Name:      tempoStackResourceName,
 			}, tempo)
 			if err != nil {
 				return ctrl.Result{RequeueAfter: 2 * time.Second}
 			}
 
-			instance.Status.Tempo = fmt.Sprintf("%s/%s (%s)", instance.Namespace, tempoName(instance.Name), tempo.Status.TempoVersion)
-			instance.Status.OpenTelemetry = fmt.Sprintf("%s/%s (%s)", instance.Namespace, otelCollectorName(instance.Name), otelcol.Status.Version)
+			instance.Status.Tempo = fmt.Sprintf("%s/%s (%s)", instance.Namespace, tempoStackResourceName, tempo.Status.TempoVersion)
+			instance.Status.OpenTelemetry = fmt.Sprintf("%s/%s (%s)", instance.Namespace, otelCollectorResourceName, otelcol.Status.Version)
 		}
 	} else {
 		instance.Status.Tempo = ""

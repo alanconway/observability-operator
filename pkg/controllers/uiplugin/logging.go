@@ -27,15 +27,7 @@ type loggingConfig struct {
 	ShowTimezoneSelector bool          `yaml:"showTimezoneSelector,omitempty"`
 }
 
-func createLoggingPluginInfo(plugin *uiv1alpha1.UIPlugin, namespace, name, image string, features []string, ctx context.Context, dk dynamic.Interface, logger logr.Logger, korrel8rImage string) (*UIPluginInfo, error) {
-	lokiStack, err := getLokiStack(plugin, ctx, dk, logger)
-	if err != nil {
-		return nil, err
-	}
-
-	lokiStackName := lokiStack.Name
-	lokiStackNamespace := lokiStack.Namespace
-
+func createLoggingPluginInfo(plugin *uiv1alpha1.UIPlugin, namespace, name, image string, features []string, lokiStackName, lokiStackNamespace string, korrel8rImage string) (*UIPluginInfo, error) {
 	config := plugin.Spec.Logging
 
 	configYaml, err := marshalLoggingPluginConfig(config)

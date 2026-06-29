@@ -2,6 +2,7 @@ package uiplugin
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 	osv1 "github.com/openshift/api/console/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
+	libgocrypto "github.com/openshift/library-go/pkg/crypto"
 	osRhobsv1 "github.com/rhobs/openshift-api/console/v1"
 	osv1alpha1 "github.com/rhobs/openshift-api/console/v1alpha1"
 	persesv1alpha2 "github.com/rhobs/perses-operator/api/v1alpha2"
@@ -254,14 +256,19 @@ func (rm resourceManager) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, nil
 	}
 
-	pluginInfo, pluginInfoErr := PluginInfoBuilder(ctx, rm.k8sClient, rm.k8sDynamicClient, plugin, rm.pluginConf, compatibilityInfo, rm.clusterVersion, rm.logger)
+	conf := rm.buildOverlayConfig(ctx, plugin, logger)
 
-	if pluginInfo != nil {
-		reconcilers := pluginComponentReconcilers(plugin, *pluginInfo, rm.clusterVersion, rm.logger)
-		for _, reconciler := range reconcilers {
-			err := reconciler.Reconcile(ctx, rm.k8sClient, rm.scheme)
-			// handle creation / updation errors that can happen due to a stale cache by
-			// retrying after some time.
+	overlay, pluginInfo, pluginInfoErr := BuildUIPluginOverlay(plugin, conf, logger)
+
+	if overlay != nil && pluginInfo != nil {
+		currentObjects, err := overlay.Build()
+		if err != nil {
+			return rm.updateStatus(ctx, req, plugin, err), err
+		}
+
+		for _, obj := range currentObjects {
+			r := reconciler.NewUpdater(obj, plugin)
+			err := r.Reconcile(ctx, rm.k8sClient, rm.scheme)
 			if apierrors.IsAlreadyExists(err) || apierrors.IsConflict(err) {
 				logger.V(8).Info("skipping reconcile error", "err", err)
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
@@ -270,8 +277,14 @@ func (rm resourceManager) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 				return rm.updateStatus(ctx, req, plugin, err), err
 			}
 		}
+
+		if plugin.Spec.Type == uiv1alpha1.TypeMonitoring {
+			if err := rm.cleanupMonitoringResources(ctx, plugin, conf, currentObjects, logger); err != nil {
+				logger.V(8).Info("monitoring cleanup error", "err", err)
+			}
+		}
+
 		if pluginInfo.AreMonitoringFeatsDisabled {
-			// prevents double rendering of monitoring console-tabs
 			if err := rm.deregisterPluginFromConsole(ctx, pluginTypeToConsoleName[plugin.Spec.Type]); err != nil {
 				return rm.updateStatus(ctx, req, plugin, err), err
 			}
@@ -279,11 +292,11 @@ func (rm resourceManager) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	if pluginInfoErr != nil {
-		// If features are disabled allow pluginComponentReconcilers to remove uiplugin-related components before status update
 		return rm.updateStatus(ctx, req, plugin, pluginInfoErr), pluginInfoErr
 	}
 
-	if err := rm.registerPluginWithConsole(ctx, pluginInfo); err != nil {
+	consoleName := pluginTypeToConsoleName[plugin.Spec.Type]
+	if err := rm.registerPluginWithConsole(ctx, consoleName); err != nil {
 		return rm.updateStatus(ctx, req, plugin, err), err
 	}
 
@@ -353,22 +366,21 @@ func (rm resourceManager) updateStatus(ctx context.Context, req ctrl.Request, pl
 	return ctrl.Result{}
 }
 
-func (rm resourceManager) registerPluginWithConsole(ctx context.Context, pluginInfo *UIPluginInfo) error {
+func (rm resourceManager) registerPluginWithConsole(ctx context.Context, consoleName string) error {
 	cluster := &operatorv1.Console{}
 	if err := rm.apiReader.Get(ctx, client.ObjectKey{Name: "cluster"}, cluster); err != nil {
 		return err
 	}
 
-	if slices.Contains(cluster.Spec.Plugins, pluginInfo.ConsoleName) {
+	if slices.Contains(cluster.Spec.Plugins, consoleName) {
 		return nil
 	}
 
-	clusterPlugins := append(cluster.Spec.Plugins, pluginInfo.ConsoleName)
+	clusterPlugins := append(cluster.Spec.Plugins, consoleName)
 
-	// Register the plugin with the console
 	cluster.Spec.Plugins = clusterPlugins
 
-	if err := reconciler.NewMerger(cluster, pluginInfo.ConsoleName).Reconcile(ctx, rm.k8sClient, rm.scheme); err != nil {
+	if err := reconciler.NewMerger(cluster, consoleName).Reconcile(ctx, rm.k8sClient, rm.scheme); err != nil {
 		return err
 	}
 
@@ -412,6 +424,82 @@ func (rm resourceManager) removeLegacyFinalizer(ctx context.Context, plugin *uiv
 		return err
 	}
 	return nil
+}
+
+func (rm resourceManager) buildOverlayConfig(ctx context.Context, plugin *uiv1alpha1.UIPlugin, logger logr.Logger) UIPluginBuildConfig {
+	conf := UIPluginBuildConfig{
+		Images:         rm.pluginConf.Images,
+		Namespace:      rm.pluginConf.ResourcesNamespace,
+		ClusterVersion: rm.clusterVersion,
+		TLSMinVersion:  string(rm.pluginConf.TLSProfile.MinTLSVersion),
+		TLSCiphers:     libgocrypto.OpenSSLToIANACipherSuites(rm.pluginConf.TLSProfile.Ciphers),
+	}
+
+	switch plugin.Spec.Type {
+	case uiv1alpha1.TypeTroubleshootingPanel:
+		conf.LokiServiceNames = make(map[string]string)
+		conf.TempoServiceNames = make(map[string]string)
+		conf.LokiServiceNames[OpenshiftLoggingNs], _ = getLokiServiceName(ctx, rm.k8sClient, OpenshiftLoggingNs)
+		conf.LokiServiceNames[OpenshiftNetobservNs], _ = getLokiServiceName(ctx, rm.k8sClient, OpenshiftNetobservNs)
+		conf.TempoServiceNames[OpenshiftTracingNs], _ = getTempoServiceName(ctx, rm.k8sClient, OpenshiftTracingNs)
+
+	case uiv1alpha1.TypeLogging:
+		lokiStack, err := getLokiStack(plugin, ctx, rm.k8sDynamicClient, logger)
+		if err == nil {
+			conf.LokiStackName = lokiStack.Name
+			conf.LokiStackNamespace = lokiStack.Namespace
+		}
+	}
+
+	return conf
+}
+
+func (rm resourceManager) cleanupMonitoringResources(ctx context.Context, plugin *uiv1alpha1.UIPlugin, conf UIPluginBuildConfig, currentObjects []client.Object, logger logr.Logger) error {
+	fullPlugin := plugin.DeepCopy()
+	if fullPlugin.Spec.Monitoring == nil {
+		fullPlugin.Spec.Monitoring = &uiv1alpha1.MonitoringConfig{}
+	}
+	if fullPlugin.Spec.Monitoring.Incidents == nil {
+		fullPlugin.Spec.Monitoring.Incidents = &uiv1alpha1.IncidentsReference{}
+	}
+	fullPlugin.Spec.Monitoring.Incidents.Enabled = true
+	if fullPlugin.Spec.Monitoring.ClusterHealthAnalyzer == nil {
+		fullPlugin.Spec.Monitoring.ClusterHealthAnalyzer = &uiv1alpha1.ClusterHealthAnalyzerReference{}
+	}
+	fullPlugin.Spec.Monitoring.ClusterHealthAnalyzer.Enabled = true
+	if fullPlugin.Spec.Monitoring.Perses == nil {
+		fullPlugin.Spec.Monitoring.Perses = &uiv1alpha1.PersesReference{}
+	}
+	fullPlugin.Spec.Monitoring.Perses.Enabled = true
+
+	fullOverlay, _, _ := BuildUIPluginOverlay(fullPlugin, conf, logger)
+	if fullOverlay == nil {
+		return nil
+	}
+	fullObjects, err := fullOverlay.Build()
+	if err != nil {
+		return nil
+	}
+
+	currentSet := make(map[string]bool)
+	for _, obj := range currentObjects {
+		currentSet[gvkNameIdentifier(obj)] = true
+	}
+
+	for _, obj := range fullObjects {
+		if !currentSet[gvkNameIdentifier(obj)] {
+			r := reconciler.NewDeleter(obj)
+			if err := r.Reconcile(ctx, rm.k8sClient, rm.scheme); err != nil {
+				logger.V(8).Info("cleanup delete failed", "object", gvkNameIdentifier(obj), "err", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func gvkNameIdentifier(obj client.Object) string {
+	return fmt.Sprintf("%s/%s", obj.GetObjectKind().GroupVersionKind().String(), obj.GetName())
 }
 
 func (rm resourceManager) getUIPlugin(ctx context.Context, req ctrl.Request) (*uiv1alpha1.UIPlugin, error) {

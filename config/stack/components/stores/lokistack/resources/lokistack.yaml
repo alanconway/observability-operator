@@ -1,0 +1,16 @@
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata:
+  name: lokistack
+spec:
+  managementState: Managed
+  tenants:
+    mode: openshift-logging
+  rules:
+    enabled: true
+    selector:
+      matchLabels:
+        openshift.io/log-alerting: "true"
+    namespaceSelector:
+      matchLabels:
+        openshift.io/log-alerting: "true"

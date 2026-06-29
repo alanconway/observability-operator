@@ -16,13 +16,9 @@ import (
 
 type operatorsStatus struct {
 	cooNamespace string
-	// Subscriptions installed in all namespaces.
-	// The subscription name can be opentelemetry-product or opentelemetry-operator.
-	subs []olmv1alpha1.Subscription
+	subs         []olmv1alpha1.Subscription
 }
 
-// ShouldInstall checks if the operator should be uninstalled.
-// The operator should be installed only if it is not installed
 func (s *operatorsStatus) ShouldInstall(operatorName string) bool {
 	for _, sub := range s.subs {
 		if strings.HasPrefix(sub.Name, operatorName) && sub.Labels[util.ResourceLabel] != util.OpName {
@@ -41,56 +37,74 @@ func (s *operatorsStatus) cooManages(operatorName string) *olmv1alpha1.Subscript
 	return nil
 }
 
-// getReconcilers returns a list of reconcilers for the ObservabilityInstaller instance.
-// The subByName is used to check if the operators are already installed, if not, they will be installed.
-// The csvByName is used to uninstall the operators, the name of the CSV contains the version therefore it must be retrieved from the cluster.
-// The CSV is not deleted when the subscription is deleted, so we need to delete it explicitly.
+func overlayConfig(opts Options) OverlayConfig {
+	return OverlayConfig{
+		OpenTelemetryOperator: opts.OpenTelemetryOperator,
+		TempoOperator:         opts.TempoOperator,
+	}
+}
+
+func isSubscription(obj client.Object) bool {
+	gvk := obj.GetObjectKind().GroupVersionKind()
+	return gvk.Group == "operators.coreos.com" && gvk.Kind == "Subscription"
+}
+
 func getReconcilers(ctx context.Context, k8sClient client.Client, k8sReader client.Reader, instance *obsv1alpha1.ObservabilityInstaller, opts Options, operatorsStatus operatorsStatus) ([]reconciler.Reconciler, error) {
 	var reconcilers []reconciler.Reconciler
-	//var otelOperator client.Object
-	//var tempoOperator client.Object
-	var instanceObjects []client.Object
-	installedObjects := map[string]client.Object{}
+	cfg := overlayConfig(opts)
 
-	// the OTEL and Tempo operators are rolling release, meaning only the latest released versions are supported.
-	// At the moment there are no compatibility issues between the operands of these two operators, so we can
-	// install them together in any versions.
-
-	otelSubs := subscription(opts.OpenTelemetryOperator)
-	tempoSubs := subscription(opts.TempoOperator)
-
-	// instance objects
-	otelCol, err := otelCollector(instance)
+	// Build overlay for the universe of all possible objects (for cleanup).
+	allInstance := instance.DeepCopy()
+	if allInstance.Spec.Capabilities == nil {
+		allInstance.Spec.Capabilities = &obsv1alpha1.CapabilitiesSpec{}
+	}
+	if allInstance.Spec.Capabilities.Tracing == nil {
+		allInstance.Spec.Capabilities.Tracing = &obsv1alpha1.TracingSpec{}
+	}
+	allInstance.Spec.Capabilities.Tracing.Enabled = true
+	allOverlay, err := BuildOverlay(allInstance, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create OpenTelemetryCollector: %w", err)
+		return nil, fmt.Errorf("building full overlay: %w", err)
 	}
-	instanceObjects = append(instanceObjects, otelCol)
-	otelcolRBAC, otelcolRBACBinding := otelCollectorComponentsRBAC(instance)
-	instanceObjects = append(instanceObjects, otelcolRBAC)
-	instanceObjects = append(instanceObjects, otelcolRBACBinding)
-	instanceObjects = append(instanceObjects, tempoStack(instance))
-
-	secrets, err := tempoStackSecrets(ctx, k8sClient, k8sReader, *instance)
+	allObjects, err := allOverlay.Build()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create TempoStack secret: %w", err)
-	}
-	if secrets.objectStorage != nil {
-		instanceObjects = append(instanceObjects, secrets.objectStorage)
-	}
-	if secrets.objectStorageTLSSecret != nil {
-		instanceObjects = append(instanceObjects, secrets.objectStorageTLSSecret)
-	}
-	if secrets.objectStorageCAConfigMap != nil {
-		instanceObjects = append(instanceObjects, secrets.objectStorageCAConfigMap)
+		return nil, fmt.Errorf("building full overlay objects: %w", err)
 	}
 
-	otelcolTempoRBAC, otelcolTempoRBACBinding := otelCollectorTempoRBAC(instance)
-	instanceObjects = append(instanceObjects, otelcolTempoRBAC)
-	instanceObjects = append(instanceObjects, otelcolTempoRBACBinding)
-	instanceObjects = append(instanceObjects, uiPlugin())
+	// Build overlay for the currently desired state.
+	currentOverlay, err := BuildOverlay(instance, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("building overlay: %w", err)
+	}
+	currentObjects, err := currentOverlay.Build()
+	if err != nil {
+		return nil, fmt.Errorf("building overlay objects: %w", err)
+	}
 
+	// Build secrets (need cluster reads, not in overlay).
+	var secretObjects []client.Object
+	if tracing := instance.Spec.GetCapabilities().GetTracing(); tracing != nil && tracing.Enabled {
+		secrets, err := tempoStackSecrets(ctx, k8sClient, k8sReader, *instance)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create TempoStack secret: %w", err)
+		}
+		if secrets.objectStorage != nil {
+			secretObjects = append(secretObjects, secrets.objectStorage)
+		}
+		if secrets.objectStorageTLSSecret != nil {
+			secretObjects = append(secretObjects, secrets.objectStorageTLSSecret)
+		}
+		if secrets.objectStorageCAConfigMap != nil {
+			secretObjects = append(secretObjects, secrets.objectStorageCAConfigMap)
+		}
+	}
+
+	// Handle deletion of the entire instance.
 	if instance.ObjectMeta.DeletionTimestamp != nil {
-		for _, obj := range instanceObjects {
+		for _, obj := range allObjects {
+			reconcilers = append(reconcilers, reconciler.NewDeleter(obj))
+		}
+		for _, obj := range secretObjects {
 			reconcilers = append(reconcilers, reconciler.NewDeleter(obj))
 		}
 		if otelSub := operatorsStatus.cooManages("opentelemetry"); otelSub != nil {
@@ -116,46 +130,53 @@ func getReconcilers(ctx context.Context, k8sClient client.Client, k8sReader clie
 		return reconcilers, nil
 	}
 
-	// Install operators and instances
-	if tracing := instance.Spec.GetCapabilities().GetTracing(); tracing != nil && tracing.Enabled {
-		// install operators and instances
-		if operatorsStatus.ShouldInstall("opentelemetry") {
-			reconcilers = append(reconcilers, reconciler.NewCreateUpdateReconciler(otelSubs, instance))
-			installedObjects[gvkNameIdentifier(otelSubs)] = otelSubs
+	// Track what we install, so we can delete the rest.
+	installedObjects := map[string]client.Object{}
+
+	// Install/update enabled objects.
+	tracing := instance.Spec.GetCapabilities().GetTracing()
+	if tracing != nil && tracing.Enabled {
+		for _, obj := range currentObjects {
+			if isSubscription(obj) {
+				if operatorsStatus.ShouldInstall(obj.GetName()) {
+					reconcilers = append(reconcilers, reconciler.NewCreateUpdateReconciler(obj, instance))
+					installedObjects[gvkNameIdentifier(obj)] = obj
+				}
+			} else {
+				reconcilers = append(reconcilers, reconciler.NewUpdater(obj, instance))
+				installedObjects[gvkNameIdentifier(obj)] = obj
+			}
 		}
-		if operatorsStatus.ShouldInstall("tempo") {
-			reconcilers = append(reconcilers, reconciler.NewCreateUpdateReconciler(tempoSubs, instance))
-			installedObjects[gvkNameIdentifier(tempoSubs)] = tempoSubs
-		}
-		for _, obj := range instanceObjects {
+		for _, obj := range secretObjects {
 			reconcilers = append(reconcilers, reconciler.NewUpdater(obj, instance))
 			installedObjects[gvkNameIdentifier(obj)] = obj
 		}
 	}
-	// install operators only
-	if tracing := instance.Spec.GetCapabilities().GetTracing(); tracing != nil &&
+
+	// Install operators only (without operand instances).
+	if tracing != nil &&
 		tracing.GetOperators() != nil &&
-		(tracing.GetOperators().Install != nil && *tracing.GetOperators().Install) {
-		// install operators only
-		if operatorsStatus.ShouldInstall("opentelemetry") {
-			reconcilers = append(reconcilers, reconciler.NewCreateUpdateReconciler(otelSubs, instance))
-			installedObjects[gvkNameIdentifier(otelSubs)] = otelSubs
-		}
-		if operatorsStatus.ShouldInstall("tempo") {
-			reconcilers = append(reconcilers, reconciler.NewCreateUpdateReconciler(tempoSubs, instance))
-			installedObjects[gvkNameIdentifier(tempoSubs)] = tempoSubs
+		tracing.GetOperators().Install != nil && *tracing.GetOperators().Install {
+		for _, obj := range currentObjects {
+			if isSubscription(obj) {
+				if operatorsStatus.ShouldInstall(obj.GetName()) {
+					reconcilers = append(reconcilers, reconciler.NewCreateUpdateReconciler(obj, instance))
+					installedObjects[gvkNameIdentifier(obj)] = obj
+				}
+			}
 		}
 	}
 
-	// Delete not created objects.
-	for _, obj := range instanceObjects {
+	// Delete objects that exist in the full set but are not currently installed.
+	for _, obj := range allObjects {
 		if installedObjects[gvkNameIdentifier(obj)] == nil {
 			reconcilers = append(reconcilers, reconciler.NewDeleter(obj))
 		}
 	}
-	// Delete CSV explicitly because it is not deleted when the subscription is deleted.
-	// This handles the uninstall case when the capability is disabled or the operators installation is disabled.
-	if otelSub := operatorsStatus.cooManages("opentelemetry"); otelSub != nil && installedObjects[gvkNameIdentifier(otelSubs)] == nil {
+
+	// Delete CSV explicitly when subscriptions are removed.
+	otelSubs := findByName(allObjects, "opentelemetry-product")
+	if otelSub := operatorsStatus.cooManages("opentelemetry"); otelSub != nil && (otelSubs == nil || installedObjects[gvkNameIdentifier(otelSubs)] == nil) {
 		reconcilers = append(reconcilers, reconciler.NewDeleter(otelSub))
 		reconcilers = append(reconcilers, reconciler.NewDeleter(
 			&olmv1alpha1.ClusterServiceVersion{
@@ -165,18 +186,28 @@ func getReconcilers(ctx context.Context, k8sClient client.Client, k8sReader clie
 				},
 			}))
 	}
-	if tempoSub := operatorsStatus.cooManages("tempo"); tempoSub != nil && installedObjects[gvkNameIdentifier(tempoSubs)] == nil {
-		reconcilers = append(reconcilers, reconciler.NewDeleter(tempoSub))
+	tempoSub := findByName(allObjects, "tempo-product")
+	if managedTempoSub := operatorsStatus.cooManages("tempo"); managedTempoSub != nil && (tempoSub == nil || installedObjects[gvkNameIdentifier(tempoSub)] == nil) {
+		reconcilers = append(reconcilers, reconciler.NewDeleter(managedTempoSub))
 		reconcilers = append(reconcilers, reconciler.NewDeleter(
 			&olmv1alpha1.ClusterServiceVersion{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      tempoSub.Status.CurrentCSV,
-					Namespace: tempoSub.Namespace,
+					Name:      managedTempoSub.Status.CurrentCSV,
+					Namespace: managedTempoSub.Namespace,
 				},
 			}))
 	}
 
 	return reconcilers, nil
+}
+
+func findByName(objects []client.Object, name string) client.Object {
+	for _, obj := range objects {
+		if obj.GetName() == name {
+			return obj
+		}
+	}
+	return nil
 }
 
 func gvkNameIdentifier(obj client.Object) string {

@@ -112,11 +112,12 @@ generate-deepcopy: $(CONTROLLER_GEN)
 generate: generate-crds generate-deepcopy generate-kustomize generate-package-resources docs
 
 .PHONY: operator
-operator: generate build
+operator: build
 
 .PHONY: build
-build:
+build: generate
 	go build -o ./tmp/operator ./cmd/operator/...
+	go build -o ./tmp/generator ./cmd/generator/...
 
 .PHONY: operator-image
 operator-image: generate

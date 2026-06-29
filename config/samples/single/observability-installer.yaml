@@ -1,0 +1,17 @@
+apiVersion: observability.openshift.io/v1alpha1
+kind: ObservabilityInstaller
+metadata:
+  name: cluster
+spec:
+  capabilities:
+    tracing:
+      enabled: true
+      storage:
+        objectStorage:
+          s3:
+            bucket: tempo
+            endpoint: http://minio.openshift-observability.svc:9000
+            accessKeyID: minio
+            accessKeySecret:
+              name: minio-credentials
+              key: secretkey

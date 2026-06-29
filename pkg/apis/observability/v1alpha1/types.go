@@ -106,6 +106,7 @@ type CapabilitiesSpec struct {
 	// +optional
 	// +kubebuilder:validation:Optional
 	Tracing *TracingSpec `json:"tracing,omitempty"`
+
 }
 
 func (c *CapabilitiesSpec) GetTracing() *TracingSpec {
